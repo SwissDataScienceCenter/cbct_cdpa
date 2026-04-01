@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "cbct-diffusion"
+version = "1.0.0"
+description = "Diffusion-based CBCT reconstruction with sinogram-guided DDIM"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0",
+    "diffusers>=0.25",
+    "numpy",
+    "scipy",
+    "scikit-image",
+    "matplotlib",
+    "tqdm",
+    "wandb",
+    "joblib",
+    "Pillow",
+    "imageio",
+    "SimpleITK",
+    "h5py",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+include = ["cbct_diffusion*"]
