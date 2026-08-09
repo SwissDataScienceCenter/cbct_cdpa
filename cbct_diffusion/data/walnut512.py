@@ -247,7 +247,20 @@ class Walnut512(Dataset):
             self.projections.append(projs.contiguous())
             self.vecs.append(vecs.copy())
 
-            num_slices = projs.shape[1]
+            # Regression fix: this used to be `projs.shape[1]`, i.e. the raw
+            # detector row count (972) -- an unrelated quantity that has
+            # nothing to do with how many axial slices the reconstruction grid
+            # has. It loaded all 972 archived "full_AGD_50_" GT slices, while
+            # fdk_reconstruction_masked below defaults to a 501-slice cubic
+            # volume for this voxel_per_mm, so GT and FDK/CDPA/DPA output ended
+            # up with mismatched shapes ("size of tensor a (972) must match
+            # size of tensor b (501)"). The original chip-project Walnut512
+            # hardcoded 501 with the comment "Standard for walnut dataset" --
+            # i.e. load only the first 501 of the 972 archived slices, matching
+            # the FDK grid. Restoring that here; it must stay a literal rather
+            # than something derived from the FDK call below, because building
+            # the external volume happens before rebuild_dataset() computes it.
+            num_slices = 501
             ext_vol, _ = build_external_volume(
                 walnut_id=wid, num_slices=num_slices,
                 data_root=self.data_path,
@@ -321,3 +334,27 @@ class Walnut512(Dataset):
 
         k_used = int(self.masks[w_idx].sum())
         return slice_recon, slice_ext, k_used, local
+
+    # ------------------------------------------------------------------
+    # Normalisation helpers
+    #
+    # Restored: missing from this class as released, though __getitem__ above
+    # already relies on the same normalize_factor convention, and
+    # reconstruct_diffusion.py's high-resolution path calls
+    # ``normalizer.normalize`` / ``normalizer.denormalize`` on a Walnut512
+    # instance (passed to DDIMPipeline as normalize_fn/denormalize_fn) -- so the
+    # released --high_resolution diffusion path cannot run at all without these.
+    # Semantics match SliceCBCTDataset.normalize/denormalize and the original
+    # chip-project Walnut512 (simple divide/multiply by normalize_factor).
+    # ------------------------------------------------------------------
+    def normalize(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Divide by ``normalize_factor``."""
+        if self.normalize_factor > 0:
+            tensor = tensor / self.normalize_factor
+        return tensor
+
+    def denormalize(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Multiply by ``normalize_factor``."""
+        if self.normalize_factor > 0:
+            tensor = tensor * self.normalize_factor
+        return tensor
