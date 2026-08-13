@@ -147,6 +147,26 @@ def main() -> None:
               f"(mean sample PSNR: {sum(p['psnr'] for p in per_sample)/len(per_sample):.3f}, "
               f"PSNR gain from averaging: {mu_metrics['psnr'] - sum(p['psnr'] for p in per_sample)/len(per_sample):+.3f} dB)")
 
+        # STD-vs-error correlation, same analysis as the paper's uncertainty
+        # section (Fig. 7): does the posterior spread predict where the
+        # reconstruction is actually wrong? Pearson/Spearman are invariant to
+        # the (positive, affine) normalisation used elsewhere in metrics.py,
+        # so this is computed directly on raw values -- no rescaling needed.
+        # Subsampled to keep the rank-based Spearman computation fast on a
+        # 501^3 volume (~125M voxels).
+        abs_err = (mean.cpu() - gt.cpu()).abs().flatten()
+        std_flat = std.flatten()
+        n_vox = abs_err.numel()
+        sub_n = min(2_000_000, n_vox)
+        idx = torch.randperm(n_vox, generator=torch.Generator().manual_seed(0))[:sub_n]
+        err_np = abs_err[idx].numpy()
+        std_np = std_flat[idx].numpy()
+        from scipy.stats import pearsonr, spearmanr
+        r, _ = pearsonr(std_np, err_np)
+        rho, _ = spearmanr(std_np, err_np)
+        print(f"STD-vs-error correlation (n={sub_n} voxels): Pearson r={r:.3f}  "
+              f"Spearman rho={rho:.3f}  R^2={r**2:.3f}")
+
     print(f"total_time_s={time.time()-t_all:.1f}  peak_gpu_gb={peak_gb:.2f}")
 
 

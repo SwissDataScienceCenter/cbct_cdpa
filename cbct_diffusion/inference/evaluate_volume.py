@@ -57,6 +57,7 @@ import cbct_diffusion  # noqa: F401  (import for side effect: ordering guard)
 from astra_torch import gd_reconstruction_masked
 
 from cbct_diffusion.data import SliceCBCTDataset, create_cbct_args
+from cbct_diffusion.inference.admm_tv_guidance import ADMMTVGuidance
 from cbct_diffusion.models import LatentUnet2D
 from cbct_diffusion.models.tomographic_cbct_diffusion import GuidanceConfig
 from cbct_diffusion.schedulers import GuidedDDIMScheduler, DDIMPipeline
@@ -441,6 +442,115 @@ def run_diffusion(args, d, device, output_dir, dataset, conditional: bool):
     print(f"  peak GPU allocated: {peak_gb:.2f} GB")
 
 
+def run_admmtv(args, d, device, output_dir, dataset, conditional: bool):
+    """DiffusionMBIR (ADMM + 1D-TV-along-z guidance), optionally FDK-conditioned.
+    See ``cbct_diffusion.inference.admm_tv_guidance``. Mirrors ``run_diffusion``'s
+    Welford mean/STD pattern when ``args.n_samples > 1``, so mu(DPA+ADMM-TV) and
+    mu(CDPA+ADMM-TV) get the same n=5-volume-averaged, LPIPS-scored treatment as
+    every other row of Table~\\ref{tab:hr_full_volume} instead of being pinned to
+    a single representative test volume.
+    """
+    tag = "cdpa_admmtv" if conditional else "dpa_admmtv"
+    gt = d["gt"]
+    common = dict(output_dir=output_dir, dataset=dataset, cbct_id=args.cbct_id,
+                  nviews=args.nviews, gt=gt, n_jobs=args.ssim_jobs)
+
+    mean_method = f"mu_{tag}_n{args.n_samples}"
+    if done(output_dir, dataset, args.cbct_id, args.nviews, tag) and \
+       (args.n_samples == 1 or done(output_dir, dataset, args.cbct_id, args.nviews, mean_method)):
+        print(f"  {tag}: already complete, nothing to do")
+        return
+
+    model = load_unet(
+        args.diffusion_checkpoint, d["fdk"].shape[0], device,
+        2 if conditional else 1, with_time=True,
+    )
+
+    guidance = ADMMTVGuidance(
+        vecs=d["vecs"], mask=d["mask"], vol_shape=d["vol_shape"],
+        det_rows=d["projs"].shape[1], det_cols=d["projs"].shape[2],
+        voxel_size_mm=d["vsm"], y=d["projs"][d["mask"]].to(device),
+        device=device, rho=args.admmtv_rho, lam=args.admmtv_lam,
+        n_admm_iters=args.admmtv_admm_iters, n_cg_iters=args.admmtv_cg_iters,
+    )
+    scheduler = GuidedDDIMScheduler(
+        num_train_timesteps=args.scheduler_train_timesteps, guidance_function=guidance,
+    )
+    pipeline = DDIMPipeline(
+        unet=model, scheduler=scheduler,
+        fdk_prior=d["fdk"].to(device) if conditional else None,
+        normalize_fn=d["normalizer"].normalize, denormalize_fn=d["normalizer"].denormalize,
+        slice_batch_size=args.slice_batch_size,
+    )
+
+    mean = None
+    m2 = None
+    torch.cuda.reset_peak_memory_stats()
+    for i in range(args.n_samples):
+        t0 = time.time()
+        gen = torch.Generator(device=device).manual_seed(args.seed + 1000 * args.cbct_id + i)
+        rec = pipeline(
+            batch_size=gt.shape[0], num_inference_steps=args.diffusion_num_steps, generator=gen,
+        ).images.detach()
+        dt = time.time() - t0
+
+        if i == 0 and not done(output_dir, dataset, args.cbct_id, args.nviews, tag):
+            emit(method=tag, pred=rec, extra={
+                "recon_time_s": dt, "sample_index": 0,
+                "admmtv_rho": args.admmtv_rho, "admmtv_lam": args.admmtv_lam,
+                "admmtv_admm_iters": args.admmtv_admm_iters, "admmtv_cg_iters": args.admmtv_cg_iters,
+            }, **common)
+
+        rec_c = rec.detach().cpu()
+        if mean is None:
+            mean = rec_c.clone()
+            m2 = torch.zeros_like(rec_c)
+        else:
+            delta = rec_c - mean
+            mean += delta / (i + 1)
+            m2 += delta * (rec_c - mean)
+        print(f"  sample {i+1}/{args.n_samples}: PSNR {float(cbct_psnr(gt.cpu(), rec_c)):.3f} ({dt:.1f}s)",
+              flush=True)
+        del rec, rec_c; torch.cuda.empty_cache()
+
+    peak_gb = torch.cuda.max_memory_allocated() / 1e9
+
+    if args.n_samples > 1:
+        emit(method=mean_method, pred=mean, extra={
+            "n_samples": args.n_samples, "peak_gpu_gb": peak_gb,
+            "admmtv_rho": args.admmtv_rho, "admmtv_lam": args.admmtv_lam,
+            "admmtv_admm_iters": args.admmtv_admm_iters, "admmtv_cg_iters": args.admmtv_cg_iters,
+        }, **common)
+        std = (m2 / (args.n_samples - 1)).sqrt()
+        _save_npz(
+            _volume_path(output_dir, dataset, args.cbct_id, args.nviews, f"std_{tag}"),
+            std.numpy().astype(np.float32),
+        )
+    print(f"  peak GPU allocated: {peak_gb:.2f} GB")
+
+
+def run_save_gt(args, d, output_dir, dataset):
+    """Persist the ground-truth volume alongside every method's reconstruction.
+
+    ``load_volume``/``load_volume_high_res`` already return ``gt`` as a side
+    effect of loading any method group, but nothing previously saved it to
+    disk -- every downstream consumer (LPIPS scoring, this function's own
+    caller) re-derives it from the dataset loader instead. This is cheap for
+    the 501^3 walnut case specifically: the ground truth is a pre-computed
+    ``full_AGD_50_*`` reconstruction read straight off disk (see
+    ``cbct_diffusion.data.walnut512.build_external_volume``), not something
+    requiring the ASTRA/GPU forward model -- only the classical/diffusion
+    method groups pay that cost, as a side effect of also building the FDK
+    prior.
+    """
+    gt_path = _volume_path(output_dir, dataset, args.cbct_id, args.nviews, "gt")
+    if gt_path.is_file():
+        print("  gt: already saved, nothing to do")
+        return
+    _save_npz(gt_path, d["gt"].detach().cpu().numpy().astype(np.float32))
+    print(f"  gt: saved to {gt_path}")
+
+
 # ------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser(description="Evaluate one CBCT volume with one method group")
@@ -449,7 +559,9 @@ def main():
                    help="one or more test-split indices; processed sequentially in "
                         "one process so cheap method groups can share a pod")
     p.add_argument("--nviews", type=int, default=20)
-    p.add_argument("--method_group", choices=["classical", "dpa", "cdpa"], required=True)
+    p.add_argument("--method_group",
+                    choices=["classical", "dpa", "cdpa", "dpa_admmtv", "cdpa_admmtv", "gt"],
+                    required=True)
     p.add_argument("--output_dir", type=str, required=True)
     p.add_argument("--high_resolution", action="store_true",
                    help="501^3 raw-TIFF walnut path (Walnut512) instead of the "
@@ -477,6 +589,15 @@ def main():
     p.add_argument("--guidance_batch_size", type=int, default=30)
     p.add_argument("--guidance_lr", type=float, nargs="+", default=[5e-4])
     p.add_argument("--guidance_clamp_min", type=float, default=0.0)
+
+    # ADMM-TV (DiffusionMBIR) hyperparameters, only used by --method_group
+    # {dpa,cdpa}_admmtv. Defaults are the ones tuned for walnut (see
+    # scripts/probe_diffusionmbir.py's lambda/iteration sweep); not retuned at
+    # 501^3, matching the main text's stated methodology.
+    p.add_argument("--admmtv_rho", type=float, default=1.0)
+    p.add_argument("--admmtv_lam", type=float, default=0.005)
+    p.add_argument("--admmtv_admm_iters", type=int, default=3)
+    p.add_argument("--admmtv_cg_iters", type=int, default=5)
 
     # GD baseline schedule: the GD_zero / GD_FDK rows of Table I were produced
     # by the *diffusion* script's schedule ([100,50,10] @ [5e-3,5e-4,1e-4]),
@@ -518,7 +639,7 @@ def main():
 
     if args.method_group == "classical" and not args.unet_checkpoint:
         raise SystemExit("--unet_checkpoint is required for --method_group classical")
-    if args.method_group in ("dpa", "cdpa") and not args.diffusion_checkpoint:
+    if args.method_group not in ("classical", "gt") and not args.diffusion_checkpoint:
         raise SystemExit(f"--diffusion_checkpoint is required for --method_group {args.method_group}")
 
     run = None
@@ -545,9 +666,14 @@ def main():
 
             if args.method_group == "classical":
                 run_classical(args, d, device, output_dir, dataset)
-            else:
+            elif args.method_group in ("dpa", "cdpa"):
                 run_diffusion(args, d, device, output_dir, dataset,
                               conditional=(args.method_group == "cdpa"))
+            elif args.method_group == "gt":
+                run_save_gt(args, d, output_dir, dataset)
+            else:
+                run_admmtv(args, d, device, output_dir, dataset,
+                           conditional=(args.method_group == "cdpa_admmtv"))
             print(f"--- id={cid}: done in {time.time()-t0:.1f}s", flush=True)
         except Exception as exc:
             # One bad volume must not discard the volumes already finished in
